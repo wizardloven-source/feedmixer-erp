@@ -43,9 +43,10 @@ from core.utils import (
     tons_to_kg,
 )
 # ملاحظة (Defense in Depth / منع دورات الاستيراد):
-#   farms_repo / invoices_repo / settings_repo تُستورد بشكل كسول (lazy)
-#   داخل الدوال فقط — لأن طبقة البيانات قد تستدعي الخدمات لاحقاً.
-from data import materials_repo  # noqa: F401  (تأكد من توفر الطبقة مبكراً)
+#   farms_repo / invoices_repo / settings_repo / recipes_repo تُستورد
+#   بشكل كسول (lazy) عبر الدوال المساعدة _farms_repo() وغيرها — لأن
+#   طبقة البيانات قد تستدعي الخدمات لاحقاً.
+from data import materials_repo  # noqa: F401  (طبقة أوراق لا تسبب دورات)
 
 log = get_logger("services.mix")
 
@@ -69,6 +70,13 @@ def _invoices_repo() -> Any:
     from data import invoices_repo as _ir
 
     return _ir
+
+
+def _recipes_repo() -> Any:
+    """استيراد كسول لمستودع الوصفات لتفادي دورات الاستيراد."""
+    from data import recipes_repo as _rr
+
+    return _rr
 
 
 # ============================================================
@@ -178,17 +186,19 @@ def calculate_mix(
     يستخدم price_items_frozen — أي أنه يحترم unit_price المجمّد
     في البنود إن وُجد (فاتورة قائمة)، وإلا يحسب حيًّا (نموذج جديد).
     """
-    from data import settings_repo as _srepo  # استيراد كسول (lazy)
-
     priced = price_items_frozen(items)
     total_weight_kg = sum(float(p["qty_kg"]) for p in priced)
     billable = calc_billable_tons(total_weight_kg)
 
-    # أسعار الإعدادات (مع fallback إلى القيم الافتراضية)
-    elec_rate = safe_float(_srepo.get_setting(
-        "electricity_fee", settings.DEFAULT_SETTINGS["electricity_fee"]))
-    labor_rate = safe_float(_srepo.get_setting(
-        "labor_fee_per_ton", settings.DEFAULT_SETTINGS["labor_fee_per_ton"]))
+    # أسعار الإعدادات عبر cache — نفس مصدر البيانات الذي تستخدمه
+    # _compute_invoice_totals عند الحفظ (cache.setting مع force=True)
+    # لضمان تطابق المعاينة الحيّة مع الرقم المحفوظ في قاعدة البيانات.
+    elec_rate = safe_float(cache.setting(
+        "electricity_fee",
+        settings.DEFAULT_SETTINGS["electricity_fee"][0], force=True))
+    labor_rate = safe_float(cache.setting(
+        "labor_fee_per_ton",
+        settings.DEFAULT_SETTINGS["labor_fee_per_ton"][0], force=True))
 
     feed_cost = round_money(sum(float(p["total_price"]) for p in priced))
     # الكهرباء قيمة ثابتة لكل خلطة (وليست مضروبة في الأطنان) — مطابقة لـ invoices_repo
@@ -260,7 +270,7 @@ def check_items_availability(items: Sequence[Mapping[str, Any]],
     current_consumption: dict[str, float] = {}
     if mix_number:
         try:
-            inv = invoices_repo.get_invoice(str(mix_number)) or {}
+            inv = _invoices_repo().get_invoice(str(mix_number)) or {}
             for row in inv.get("items", []) or []:
                 n = str(row.get("material_name", ""))
                 current_consumption[n] = (current_consumption.get(n, 0.0)
@@ -303,9 +313,7 @@ def format_deficits_report(deficits: Sequence[Mapping[str, Any]]) -> str:
 
 def recipe_to_items(recipe_id: int) -> list[dict[str, Any]]:
     """يحوّل وصفة محفوظة إلى بنود جاهزة لشاشة الخلطة."""
-    from data import recipes_repo
-
-    recipe = recipes_repo.get_recipe(int(recipe_id)) or {}
+    recipe = _recipes_repo().get_recipe(int(recipe_id)) or {}
     items: list[dict[str, Any]] = []
     for row in recipe.get("items", []) or []:
         name = str(row.get("material_name", "") or "").strip()
@@ -335,7 +343,7 @@ def save_mix(
     يستخدم price_items (سعر حيّ) — لأنها خلطة جديدة.
     """
     priced = price_items(items)
-    mix_number = invoices_repo.add_invoice(
+    mix_number = _invoices_repo().add_invoice(
         mix_date=mix_date,
         farm_name=farm_name,
         worker_name=worker_name,
