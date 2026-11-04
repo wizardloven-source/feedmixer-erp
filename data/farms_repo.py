@@ -42,18 +42,34 @@ def get_farm_by_name(name: str) -> dict | None:
     return query_one("SELECT * FROM farms WHERE name = ?", (str(name or "").strip(),))
 
 
-def farm_transaction_count(name: str) -> int:
-    """عدد الفواتير + المدفوعات المرتبطة بالمزرعة (كل الحالات)."""
+def farm_transaction_count(name: str) -> dict[str, int]:
+    """
+    عدد الارتباطات المالية والمرجعية للمزرعة (كل الحالات).
+
+    تحصين المرحلة 4: كانت الدالة تعيد عدداً صحيحاً لمجموع الفواتير +
+    المدفوعات فقط، ولا تفحص recipes.farm_name — فيُحذف مزرعة وتبقى
+    وصفاتها معلّقة بلا مرجع. الآن يعيد قاموساً:
+        {"financial": فواتير + مدفوعات,   ← يمنع الحذف إذا > 0
+         "recipes":   عدد الوصفات}        ← يُسمح مع تسجيل audit تحذيري
+    """
+    text = str(name or "")
     row = query_one(
         "SELECT "
         " (SELECT COUNT(*) FROM mix_invoices WHERE farm_name = ?) + "
-        " (SELECT COUNT(*) FROM payments WHERE farm_name = ?) AS total",
-        (str(name or ""), str(name or "")),
+        " (SELECT COUNT(*) FROM payments WHERE farm_name = ?) AS financial, "
+        " (SELECT COUNT(*) FROM recipes WHERE farm_name = ?) AS recipes",
+        (text, text, text),
     )
+    data = row or {}
     try:
-        return int((row or {}).get("total") or 0)
+        financial = int(data.get("financial") or 0)
     except (TypeError, ValueError):
-        return 0
+        financial = 0
+    try:
+        recipes = int(data.get("recipes") or 0)
+    except (TypeError, ValueError):
+        recipes = 0
+    return {"financial": financial, "recipes": recipes}
 
 
 # ============================================================
@@ -194,17 +210,27 @@ def delete_farm(farm_id: int) -> bool:
     """
     يحذف مزرعة بلا حركات مالية فقط.
     يرفع ValueError إذا كانت مرتبطة بفواتير/مدفوعات (استخدم الأرشفة).
+
+    تحصين المرحلة 4: الوصفات (recipes.farm_name نصية بلا FK) لا تمنع
+    الحذف — بل يُسمح به مع تسجيل تحذير في audit_log لتتبع البيانات
+    المعلّقة، لأن منعها يعيق المستخدم دون مكسب سلامة فعلي.
     """
     old = get_farm(farm_id)
     if not old:
         return False
     name = str(old.get("name") or "")
-    if farm_transaction_count(name) > 0:
+    counts = farm_transaction_count(name)
+    if counts["financial"] > 0:
         raise ValueError(
             f"لا يمكن حذف «{name}» لوجود فواتير أو مدفوعات مرتبطة بها. استخدم الأرشفة."
         )
     execute("DELETE FROM farms WHERE id = ?", (int(farm_id),))
-    log_audit("DELETE", "farms", farm_id, {"name": name}, None)
+    audit_details: dict[str, object] = {"name": name}
+    if counts["recipes"] > 0:
+        # بيانات مرجعية معلّقة مقبولة — تُسجَّل للمساءلة فقط
+        audit_details["orphaned_recipes"] = counts["recipes"]
+        _log.warning("حذف مزرعة «%s» ولها %d وصفة أصبحت معلّقة", name, counts["recipes"])
+    log_audit("DELETE", "farms", farm_id, {"name": name}, audit_details)
     cache.invalidate_farms()
     return True
 

@@ -7,6 +7,7 @@ ui/tabs/_common.py
     TabUI      : حاوية عناصر أساسية (شريط أدوات + حقل بحث + Treeview)
     build_tab  : يبني الهيكل الأساسي لتبويب قائمة/جداول
     fmt        : تنسيق الأرقام للعرض داخل الجداول
+    notify_refresh : إطلاق حدث <<TreeRefreshed>> لتحديث لقطة البحث
 
 نمط التبويب الموحّد:
     toolbar (يمين: أزرار الإجراءات | يسار: حقل البحث)
@@ -14,6 +15,12 @@ ui/tabs/_common.py
 
 كل تبويب يستدعي build_tab(parent, app, buttons=[...], columns=[...])
 ويحصل على TabUI جاهز، ثم يملأ self.ui.tree بالبيانات في refresh().
+
+إصلاح المرحلة 3: أُضيفت الدالة notify_refresh() وتُستدعى في نهاية
+fill_rows/clear_tree — لأن TreeSearch كانت تحتفظ بلقطة iids قديمة من
+وقت __init__ فلا يعمل البحث بعد أي refresh/F5. أي تبويب يعيد بناء جدول
+الإدراج يدوياً (بدل fill_rows) يجب أن يستدعي notify_refresh(tree) بنفسه
+(مثال: ui/tabs/inventory.py).
 """
 
 from __future__ import annotations
@@ -55,6 +62,27 @@ def _tree_columns(tree: ttk.Treeview) -> tuple[str, ...]:
         return tuple(str(c) for c in tree["columns"])
     except tk.TclError:
         return ()
+
+
+def notify_refresh(tree: ttk.Treeview) -> None:
+    """يخبر TreeSearch أن الجدول تغيّر فيحدّث snapshot.
+
+    الإصلاح الحرج: بعد clear_tree + insert تصبح كل الـ iids القديمة محذوفة
+    وجديدة غير معروفة للبحث؛ التحديث المباشر (refresh_snapshot) يضمن عمل
+    البحث فوراً حتى داخل معالجات الأحداث — حيث لا يعمل event_generate إلا
+    بعد انتهاء المعالج (سلوك Tk المعروف). نطلق الحدث أيضاً لإبقاء الأربطة
+    الأخرى المتوافقة (مثل عدّاد الصفوف) محدَّثة خارج معالجات الأحداث.
+    """
+    ts = getattr(tree, "_feedmixer_search", None)  # مرجع كائن البحث المرتبط
+    if ts is not None:
+        try:
+            ts.refresh_snapshot()
+        except tk.TclError:
+            pass
+    try:
+        tree.event_generate("<<TreeRefreshed>>")
+    except tk.TclError as exc:
+        _log.debug("تعذّر إطلاق حدث تحديث الجدول: %s", exc)
 
 
 @dataclass
@@ -218,6 +246,9 @@ def build_tab(
 
     tree.bind("<<TreeviewInsert>>", _update_count, add="+")
     tree.bind("<<TreeviewDeleteItem>>", _update_count, add="+")
+    # إصلاح المرحلة 3: عند إعادة بناء الجدول (حدث TreeRefreshed) يجب أيضاً
+    # تصحيح عدّاد الصفوف وإلا بقي يعرض العدد القديم بعد F5
+    tree.bind("<<TreeRefreshed>>", _update_count, add="+")
     parent.bind("<KeyRelease>", lambda _e: parent.after(120, _update_count), add="+")
     parent.bind("<<TreeSearchFiltered>>", _update_count, add="+")
     _update_count()
@@ -242,6 +273,9 @@ def fill_rows(tree: ttk.Treeview, rows: Sequence[Sequence[Any]]) -> None:
             tree.insert("", "end", values=tuple("" if v is None else v for v in row))
     except tk.TclError:
         _log.exception("تعذّر ملء الجدول")
+    # إصلاح المرحلة 3: إخطار TreeSearch بعد كل إعادة بناء حتى لا يفقد
+    # نتائجه (لقطة الـ iids القديمة صارت محذوفة) بعد F5/refresh
+    notify_refresh(tree)
 
 
-__all__ = ["TabUI", "build_tab", "clear_tree", "fill_rows", "fmt"]
+__all__ = ["TabUI", "build_tab", "clear_tree", "fill_rows", "fmt", "notify_refresh"]

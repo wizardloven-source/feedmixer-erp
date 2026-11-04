@@ -3,19 +3,23 @@ services/mix_service.py
 -----------------------
 منطق حساب تكاليف الخلطة وفحص المخزون قبل الحفظ.
 
-القواعد المحاسبية المطبَّقة (مطابقة لمواصفات النظام):
+القواعد المحاسبية المطبَّقة (Single Source of Truth — مطابقة تماماً
+لـ data/invoices_repo._compute_invoice_totals، ولا يجوز تعديل واحدة
+دون الأخرى؛ راجع tests/test_mix_calc.py الذي يفرض التطابق):
     1) سعر الكيلو من المادة حسب وحدة القياس:
          ton   : (base_price + handling_fee + loss_fee) / 1000
          kg    :  base_price + handling_fee + loss_fee
          fixed :  base_price
        (يُنفَّذ في core.utils.material_kg_price)
-    2) تكلفة العلف = Σ (qty_kg × سعر_الكيلو)
+    2) تكلفة العلف feed_cost = Σ (qty_kg × unit_price)
     3) أنصاف الأطنان القابلة للفوترة = int((kg_total + 249) / 500) * 0.5
-    4) أجور العمال = billable_tons × labor_fee_per_ton
-    5) الكهرباء     = billable_tons × electricity_fee
-    6) النقل        = transport_fee للمزرعة × billable_tons
-    7) الإجمالي = علف + كهرباء + عمال + نقل
-    8) الصافي   = الإجمالي إلا إذا عدِّل يدوياً (net_cost_manually_edited)
+    4) أجور العمال labor_cost = billable_tons × labor_fee_per_ton
+    5) الكهرباء     elec_cost = electricity_fee          ← قيمة ثابتة لكل خلطة
+       (حسب وصف DEFAULT_SETTINGS: "أجرة الكهرباء (لكل خلطة)")
+    6) النقل        transport_cost = farm.transport_fee  ← قيمة ثابتة لكل فاتورة
+       (حسب وصف DEFAULT_SETTINGS: "أجرة النقل الافتراضية")
+    7) الإجمالي total_cost = feed_cost + elec_cost + labor_cost + transport_cost
+    8) الصافي mixer_net_cost = total_cost إلا إذا عدِّل يدوياً (net_cost_override)
 
 تجميد السعر (Price Snapshot):
     - عند الإنشاء: السعر يُقرأ حيًّا من materials ويُخزَّن في mix_items.unit_price.
@@ -38,9 +42,41 @@ from core.utils import (
     safe_float,
     tons_to_kg,
 )
-from data import farms_repo, invoices_repo, settings_repo
+# ملاحظة (Defense in Depth / منع دورات الاستيراد):
+#   farms_repo / invoices_repo / settings_repo / recipes_repo تُستورد
+#   بشكل كسول (lazy) عبر الدوال المساعدة _farms_repo() وغيرها — لأن
+#   طبقة البيانات قد تستدعي الخدمات لاحقاً.
+from data import materials_repo  # noqa: F401  (طبقة أوراق لا تسبب دورات)
 
 log = get_logger("services.mix")
+
+
+def _settings_repo() -> Any:
+    """استيراد كسول لمستودع الإعدادات لتفادي دورات الاستيراد."""
+    from data import settings_repo as _sr
+
+    return _sr
+
+
+def _farms_repo() -> Any:
+    """استيراد كسول لمستودع المزارع لتفادي دورات الاستيراد."""
+    from data import farms_repo as _fr
+
+    return _fr
+
+
+def _invoices_repo() -> Any:
+    """استيراد كسول لمستودع الفواتير لتفادي دورات الاستيراد."""
+    from data import invoices_repo as _ir
+
+    return _ir
+
+
+def _recipes_repo() -> Any:
+    """استيراد كسول لمستودع الوصفات لتفادي دورات الاستيراد."""
+    from data import recipes_repo as _rr
+
+    return _rr
 
 
 # ============================================================
@@ -136,6 +172,17 @@ def calculate_mix(
     """
     الحساب الكامل للخلطة قبل الحفظ أو أثناء المعاينة الحيّة.
 
+    ⚠️ Single Source of Truth:
+        هذه الدالة مطابقة حرفياً في قواعدها لـ
+        data/invoices_repo._compute_invoice_totals — أي تغيير في
+        واحدة يجب أن يُطبَّق على الأخرى، ويثبّته tests/test_mix_calc.py:
+            feed_cost      = Σ (qty_kg × unit_price)
+            elec_cost      = electricity_fee          (قيمة ثابتة لكل خلطة)
+            labor_cost     = billable_tons × labor_fee_per_ton
+            transport_cost = farm.transport_fee       (قيمة ثابتة لكل فاتورة)
+            total_cost     = feed + elec + labor + transport
+            mixer_net_cost = total_cost إلا عند التعديل اليدوي
+
     يستخدم price_items_frozen — أي أنه يحترم unit_price المجمّد
     في البنود إن وُجد (فاتورة قائمة)، وإلا يحسب حيًّا (نموذج جديد).
     """
@@ -143,20 +190,25 @@ def calculate_mix(
     total_weight_kg = sum(float(p["qty_kg"]) for p in priced)
     billable = calc_billable_tons(total_weight_kg)
 
-    # أسعار الإعدادات (مع fallback إلى القيم الافتراضية)
-    elec_rate = safe_float(settings_repo.get_setting(
-        "electricity_fee", settings.DEFAULT_SETTINGS["electricity_fee"]))
-    labor_rate = safe_float(settings_repo.get_setting(
-        "labor_fee_per_ton", settings.DEFAULT_SETTINGS["labor_fee_per_ton"]))
+    # أسعار الإعدادات عبر cache — نفس مصدر البيانات الذي تستخدمه
+    # _compute_invoice_totals عند الحفظ (cache.setting مع force=True)
+    # لضمان تطابق المعاينة الحيّة مع الرقم المحفوظ في قاعدة البيانات.
+    elec_rate = safe_float(cache.setting(
+        "electricity_fee",
+        settings.DEFAULT_SETTINGS["electricity_fee"][0], force=True))
+    labor_rate = safe_float(cache.setting(
+        "labor_fee_per_ton",
+        settings.DEFAULT_SETTINGS["labor_fee_per_ton"][0], force=True))
 
     feed_cost = round_money(sum(float(p["total_price"]) for p in priced))
-    elec_cost = round_money(billable * elec_rate)
+    # الكهرباء قيمة ثابتة لكل خلطة (وليست مضروبة في الأطنان) — مطابقة لـ invoices_repo
+    elec_cost = round_money(elec_rate)
     labor_cost = round_money(billable * labor_rate)
 
-    # أجرة النقل خاصة بالمزرعة (لكل طن قابل للفوترة)
-    farm = farms_repo.get_farm_by_name(farm_name) or {}
+    # أجرة النقل قيمة ثابتة خاصة بالمزرعة لكل فاتورة (وليست مضروبة في الأطنان)
+    farm = _farms_repo().get_farm_by_name(farm_name) or {}
     farm_transport_rate = safe_float(farm.get("transport_fee"), 0.0)
-    transport_cost = round_money(billable * farm_transport_rate)
+    transport_cost = round_money(farm_transport_rate)
 
     total_cost = round_money(feed_cost + elec_cost + labor_cost + transport_cost)
 
@@ -218,7 +270,7 @@ def check_items_availability(items: Sequence[Mapping[str, Any]],
     current_consumption: dict[str, float] = {}
     if mix_number:
         try:
-            inv = invoices_repo.get_invoice(str(mix_number)) or {}
+            inv = _invoices_repo().get_invoice(str(mix_number)) or {}
             for row in inv.get("items", []) or []:
                 n = str(row.get("material_name", ""))
                 current_consumption[n] = (current_consumption.get(n, 0.0)
@@ -261,9 +313,7 @@ def format_deficits_report(deficits: Sequence[Mapping[str, Any]]) -> str:
 
 def recipe_to_items(recipe_id: int) -> list[dict[str, Any]]:
     """يحوّل وصفة محفوظة إلى بنود جاهزة لشاشة الخلطة."""
-    from data import recipes_repo
-
-    recipe = recipes_repo.get_recipe(int(recipe_id)) or {}
+    recipe = _recipes_repo().get_recipe(int(recipe_id)) or {}
     items: list[dict[str, Any]] = []
     for row in recipe.get("items", []) or []:
         name = str(row.get("material_name", "") or "").strip()
@@ -293,7 +343,7 @@ def save_mix(
     يستخدم price_items (سعر حيّ) — لأنها خلطة جديدة.
     """
     priced = price_items(items)
-    mix_number = invoices_repo.add_invoice(
+    mix_number = _invoices_repo().add_invoice(
         mix_date=mix_date,
         farm_name=farm_name,
         worker_name=worker_name,

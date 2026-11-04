@@ -4,6 +4,18 @@ ui/tabs/inventory.py
 تبويب «المخزون»: أرصدة المواد (المورد − المستهلك = المتبقي)
 مع تنبيه الأصناف الأقل من 5 طن والعجز السلبي.
 
+إصلاحات المرحلة 3:
+    * حذف دالة adjust_quantity المعطوبة نهائياً — كانت تحتوي نصاً عربياً
+      مشوّه الترميز (mojibake)، ولا يوجد زر يستدعيها، وتستدعي
+      inventory_service.set_manual_remaining() الوهمية التي ترجع False دائماً.
+    * تصحيح مفاتيح القراءة من inventory_service._load_balances():
+        supplied_ton / consumed_ton / remaining_ton
+      بدلاً من المفاتيح غير الموجودة in_ton / out_ton / remaining_kg
+      (كانت أعمدة «المورد» و«المستهلك» و«المتبقي كغ» تظهر صفراً دائماً).
+    * عمود «المتبقي (كغ)» يُحسب محلياً للعرض فقط: remaining_ton × KG_PER_TON.
+    * بعد كل إعادة بناء للجدول يُطلق حدث <<TreeRefreshed>> ليحدّث
+      TreeSearch snapshot — فيستمر البحث الفوري بعد F5 (راجع ui/widgets.py).
+
 واجهة التبويب (يتوقعها ui/main_window):
     build(parent, app) -> InventoryController
     controller.refresh()        (F5 / عند فتح التبويب)
@@ -21,6 +33,7 @@ from config import settings
 from core.logger import get_logger
 from services import inventory_service
 from ui.tabs._common import TabUI, build_tab, clear_tree, fmt
+from ui.widgets import TreeSearch
 
 _log = get_logger("ui.tabs.inventory")
 
@@ -29,6 +42,31 @@ STATUS_LABELS = {
     "low": "⚠️ منخفض",
     "negative": "🛑 عجز",
 }
+
+
+def _find_search(tree: ttk.Treeview) -> TreeSearch | None:
+    """يعيد كائن البحث المرتبط بالجدول إن وُجد (للتحديث الموثوق بعد refresh)."""
+    return getattr(tree, "_feedmixer_search", None)
+
+
+def notify_refresh(tree: ttk.Treeview) -> None:
+    """يخبر TreeSearch أن الجدول أُعيد بناؤه فيحدّث snapshot.
+
+    إصلاح حرج: بدون هذا التحديث تبقى _all_children تحمل iids قديمة بعد
+    أي refresh/F5 فلا يجد البحث الصفوف الجديدة. نستخدم النداء المباشر
+    لأن event_generate لا يعمل داخل معالجات الأحداث (سلوك Tk المعروف)،
+    ونطلق الحدث أيضاً لتبقياته المتوافقة مع الأربطة الأخرى.
+    """
+    ts = _find_search(tree)
+    if ts is not None:
+        try:
+            ts.refresh_snapshot()
+        except tk.TclError:
+            pass
+    try:
+        tree.event_generate("<<TreeRefreshed>>")
+    except tk.TclError:
+        pass
 
 
 class InventoryController:
@@ -72,15 +110,17 @@ class InventoryController:
 
         self.status_var.trace_add("write", _sync_hint)
 
+        # إصلاح: أسماء الأعمدة صارت مطابقة لمفاتيح الخدمة
+        # (supplied_ton/consumed_ton/remaining_ton) بدل in_ton/out_ton الخاطئة
         self.ui = build_tab(
             parent, self.app,
-            columns=["material", "unit", "in_ton", "out_ton", "remain_ton",
-                     "remain_kg", "status"],
+            columns=["material", "unit", "supplied_ton", "consumed_ton",
+                     "remain_ton", "remain_kg", "status"],
             headings=[
                 ("material", "المادة", 160),
                 ("unit", "الوحدة", 70),
-                ("in_ton", "المورد (طن)", 100),
-                ("out_ton", "المستهلك (طن)", 110),
+                ("supplied_ton", "المورد (طن)", 100),
+                ("consumed_ton", "المستهلك (طن)", 110),
                 ("remain_ton", "المتبقي (طن)", 110),
                 ("remain_kg", "المتبقي (كغ)", 110),
                 ("status", "الحالة", 110),
@@ -89,6 +129,7 @@ class InventoryController:
                 ("🔄 تحديث", "flat", self.refresh),
                 ("📤 تصدير", "flat", self.export_current),
             ],
+            # ملاحظة: لا يوجد زر «تسوية/تعديل كمية» — الدالة حُذفت (كود ميت)
         )
         tree = self.ui.tree
         try:
@@ -100,6 +141,16 @@ class InventoryController:
         tree.bind("<Double-1>", lambda _e: self.show_detail())
 
     # ------------------------------------------------------------ تحديث
+    @staticmethod
+    def _row_status(row: dict[str, Any]) -> str:
+        """يحدد حالة الصف من حقول الخدمة نفسها (low/negative) بسلّم موثوق."""
+        remaining = float(row.get("remaining_ton", 0.0) or 0.0)
+        if row.get("negative") or remaining < 0:
+            return "negative"
+        if row.get("low") or remaining < settings.LOW_STOCK_THRESHOLD_TONS:
+            return "low"
+        return "ok"
+
     def refresh(self) -> None:
         if not self._built or self.ui is None:
             return
@@ -113,22 +164,20 @@ class InventoryController:
         status = self.status_var.get()
         rows = []
         for r in rows_all:
-            remaining = float(r.get("remaining_ton", 0.0))
-            if remaining < 0:
-                st = "negative"
-            elif remaining < settings.LOW_STOCK_THRESHOLD_TONS:
-                st = "low"
-            else:
-                st = "ok"
+            st = self._row_status(r)
             if status != "all" and status != st:
                 continue
+            remaining = float(r.get("remaining_ton", 0.0) or 0.0)
+            # إصلاح: المفاتيح الصحيحة من inventory_service._load_balances؛
+            # remaining_kg غير موجود في الخدمة فيُحسب محلياً للعرض فقط
+            remaining_kg = remaining * settings.KG_PER_TON
             rows.append((
                 r.get("name", ""),
                 str(r.get("unit_type", "ton")),
-                fmt(r.get("in_ton", 0.0)),
-                fmt(r.get("out_ton", 0.0)),
+                fmt(r.get("supplied_ton", 0.0)),
+                fmt(r.get("consumed_ton", 0.0)),
                 fmt(remaining),
-                fmt(float(r.get("remaining_kg", 0.0)), -1),
+                fmt(remaining_kg, -1),
                 STATUS_LABELS[st],
             ))
         # الإدراج اليدوي هنا (بدل fill_rows) لدعم وسوم الألوان حسب الحالة
@@ -139,11 +188,13 @@ class InventoryController:
                        else "low" if "⚠️" in label else "ok")
             self.ui.tree.insert("", "end", values=row[:7], tags=(tag_key,),
                                 iid=f"I{idx}")
+        # إصلاح: إخطار TreeSearch بإعادة بناء الجدول حتى لا يفقد البحث
+        # نتائجه بعد F5 (snapshot كان يحمل iids قديمة محذوفة)
+        notify_refresh(self.ui.tree)
 
-        low_n = sum(1 for r in rows_all
-                    if 0 <= float(r.get("remaining_ton", 0)) < settings.LOW_STOCK_THRESHOLD_TONS)
-        neg_n = sum(1 for r in rows_all if float(r.get("remaining_ton", 0)) < 0)
-        total_remaining = sum(float(r.get("remaining_ton", 0)) for r in rows_all)
+        low_n = sum(1 for r in rows_all if self._row_status(r) == "low")
+        neg_n = sum(1 for r in rows_all if self._row_status(r) == "negative")
+        total_remaining = sum(float(r.get("remaining_ton", 0) or 0.0) for r in rows_all)
         self.summary_var.set(
             f"إجمالي المتبقي: {total_remaining:,.1f} طن | "
             f"منخفض: {low_n} | عجز: {neg_n}"
@@ -163,21 +214,28 @@ class InventoryController:
         try:
             bal = next((r for r in inventory_service.inventory_balances()
                         if str(r.get("name")) == name), {})
-        except Exception:
+        except Exception:  # noqa: BLE001
             bal = {}
         win = tk.Toplevel(self.ui.tree.winfo_toplevel())
         win.title(f"تفاصيل: {name}")
         win.geometry("420x300")
         txt = tk.Text(win, font=settings.FONT_BASE, wrap="word")
         txt.pack(fill="both", expand=True, padx=6, pady=6)
+        # إصلاح: المفاتيح الصحيحة (supplied_ton/consumed_ton) وحساب الكغ
+        # محلياً من remaining_ton × KG_PER_TON — كان يقرأ مفاتيح غير موجودة
+        supplied = float(bal.get("supplied_ton", 0) or 0.0)
+        consumed = float(bal.get("consumed_ton", 0) or 0.0)
+        remaining = float(bal.get("remaining_ton", 0) or 0.0)
         lines = [
             f"المادة: {name}",
             f"الوحدة: {bal.get('unit_type', 'ton')}",
-            f"المورد: {float(bal.get('in_ton', 0)):,.2f} طن",
-            f"المستهلك: {float(bal.get('out_ton', 0)):,.2f} طن",
-            f"المتبقي: {float(bal.get('remaining_ton', 0)):,.2f} طن "
-            f"({float(bal.get('remaining_kg', 0)):,.0f} كغ)",
+            f"المورد: {supplied:,.2f} طن",
+            f"المستهلك: {consumed:,.2f} طن",
+            f"المتبقي: {remaining:,.2f} طن "
+            f"({remaining * settings.KG_PER_TON:,.0f} كغ)",
         ]
+        if bal.get("missing"):
+            lines.append("⚠️ مادة غير مسجَّلة في جدول المواد (حركة يتيماء)")
         txt.insert("1.0", "\n".join(lines))
         txt.configure(state="disabled")
 
@@ -191,67 +249,9 @@ class InventoryController:
             self.ui.search_entry.focus_set()
 
 
+# ملاحظة: دالة adjust_quantity حُذفت نهائياً (كود ميت: لا زر يستدعيها،
+# ترميز عربي مشوّه mojibake، وتعتمد على set_manual_remaining الوهمية).
 
-    def adjust_quantity(self) -> None:
-        """إضافة/ تعديل كمية مادة محددة عند تسوية المخزون."""
-        if self.ui is None:
-            return
-        sel = self.ui.tree.selection()
-        if not sel:
-            self.app.toast("ط§ط®طھط± ظ…ط§ط¯ط© ظ…ظ† ط§ظ„ط¬ط¯ظˆظ„", "warning")
-            return
-        name = self.ui.selected_row().get("material", "")
-        if not name:
-            self.app.toast("ط§ط®طھط± ظ…ط§ط¯ط© ظ…ظ† ط§ظ„ط¬ط¯ظˆظ„", "warning")
-            return
-        try:
-            bal = next((r for r in inventory_service.inventory_balances()
-                        if str(r.get("name")) == name), {})
-        except Exception:
-            bal = {}
-        current = float(bal.get("remaining_ton", 0.0))
-        import tkinter as tk
-        root = tk.Toplevel(self.ui.tree.winfo_toplevel())
-        root.title(f"ط§ظ„ط·ط¨ط§ط¹ط©: {name}")
-        root.geometry("360x200")
-        ttk.Label(root, text="ط§ظ„طھط§ط±ظٹط® ط§ظ„ظ…ط§ط¯ط©:", font=settings.FONT_BASE).pack(anchor="w", padx=20, pady=(20, 5))
-        entry = ttk.Entry(root, width=40, font=settings.FONT_BASE)
-        entry.insert(0, f"{current:,.3f}")
-        entry.pack(padx=20, pady=(0, 10))
-        result = {"value": None}
-
-        def ok():
-            try:
-                val = float(entry.get().replace(",", "").replace(" ", ""))
-                if val < 0:
-                    raise ValueError("كمية سالبة غير مسموحة")
-                result["value"] = val
-            except (ValueError, tk.TclError):
-                self.app.toast("يرجى إدخال رقم صحيح للكمية", "error")
-                return
-            root.destroy()
-
-        def cancel():
-            root.destroy()
-
-        btn_row = ttk.Frame(root)
-        btn_row.pack(padx=20, pady=(0, 20), fill="x")
-        ttk.Button(btn_row, text="ط§ط®طھط±", command=ok).pack(side="right", padx=(10, 0))
-        ttk.Button(btn_row, text="ط¥ظ„ط؛ط§ط¤", command=cancel).pack(side="right", padx=(0, 10))
-        root.wait_window(root)
-        root.destroy()
-
-        if result["value"] is None:
-            return
-        try:
-            ok = inventory_service.set_manual_remaining(name, result["value"])
-            if ok:
-                self.app.toast(f"طھظ… ط§ظ „ط·ط¨ط§ط¹ط© آ«{name}آ» ط¨ظ†ط¬ط§ط­ ًں”‘", "success")
-                self.refresh()
-            else:
-                self.app.toast("ط§ظ„ظ…ط§ط¯ط© ط؛ظٹط± ظ…ظˆط¬ظˆط¯ط©", "error")
-        except Exception as exc:
-            self.app.toast(f"ط®ط·ط£: {exc}", "error")
 
 def build(parent: tk.Misc, app: Any) -> InventoryController:
     """نقطة الدخول التي تستدعيها النافذة الرئيسية."""
