@@ -6,26 +6,35 @@ data/invoices_repo.py
 الصيغة المحاسبية (راجع core.utils):
     billable_tons = int((total_weight_kg + 249) / 500) * 0.5
     feed_cost     = Σ (qty_kg * unit_price)
-    elec_fee      = إعداد الكهرباء
-    labor_fee     = billable_tons * إعداد أجرة العمال
-    transport     = أجرة النقل للمزرعة المختارة
+    elec_fee      = إعداد الكهرباء                      ← قيمة ثابتة لكل خلطة
+    labor_fee     = billable_tons * إعداد أجرة العمال   ← متغيرة مع الوزن
+    transport     = أجرة النقل للمزرعة المختارة          ← قيمة ثابتة لكل فاتورة
     total_cost    = feed_cost + elec_fee + labor_fee + transport
     mixer_net_cost= total_cost (إلا إذا تم تعديل الصافي يدوياً)
 
 الخلطة تُحفظ ذرّياً: الفاتورة + كل عناصرها في معاملة واحدة.
 soft delete: is_deleted + deleted_at (لا يُحذف نهائياً إلا للصيانة).
+
+تحصين المرحلة 4 (Defense in Depth):
+    1) add_invoice/set_payment_status يتحققان من payment_status عبر
+       validate_choice ضد settings.PAYMENT_STATUSES (منع تلوث البيانات).
+    2) soft_delete_invoice يفحص الدفعات قبل الحذف ويرفضه إذا كان سيؤدي
+       إلى رصيد سالب للمزرعة (دفعة يتيمة بلا فاتورة مرجعية).
+    3) update_invoice تستخدم diff للبنود بدل DELETE+INSERT الكامل —
+       الحفاظ على id و price_snapshot_at مهم للتدقيق.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
+from config import settings
 from core import cache
 from core.logger import get_logger, log_audit
 from core.utils import calc_billable_tons, kg_to_tons, safe_float, safe_int
-from core.validators import validate_date, validate_name, validate_number
+from core.validators import validate_choice, validate_date, validate_name, validate_number
 from data.connection import execute, query_all, query_one, transaction
-from data import materials_repo, farms_repo
+from data import farms_repo
 
 _log = get_logger("mixer.invoices_repo")
 
@@ -244,6 +253,10 @@ def add_invoice(
     if farms_repo.get_farm_by_name(clean_farm) is None:
         raise ValueError(f"المزرعة «{clean_farm}» غير موجودة")
 
+    # تحصين المرحلة 4: التحقق من حالة الدفع قبل الحفظ (Defense in Depth)
+    # — سابقاً كانت أي قيمة عشوائية تُحفظ وتلوّث البيانات.
+    status = validate_choice(payment_status, settings.PAYMENT_STATUSES, "حالة الدفع")
+
     cleaned_items = _validate_items(items or [])
 
     electricity_fee = cache.setting("electricity_fee", force=True)
@@ -273,7 +286,7 @@ def add_invoice(
                     totals["total_weight"],
                     totals["total_cost"],
                     round(net_cost, 2),
-                    payment_status,
+                    status,
                     str(notes or "").strip() or None,
                     totals["elec_fee"],
                     totals["labor_fee"],
@@ -285,10 +298,11 @@ def add_invoice(
                 ),
             )
             for item in cleaned_items:
+                # price_snapshot_at يُكتب عند الإدراج فقط (طابع زمني محلي)
                 conn.execute(
                     "INSERT INTO mix_items "
-                    "(mix_number, material_name, qty_kg, unit_price, total_price) "
-                    "VALUES (?, ?, ?, ?, ?)",
+                    "(mix_number, material_name, qty_kg, unit_price, total_price, price_snapshot_at) "
+                    "VALUES (?, ?, ?, ?, ?, datetime('now','localtime'))",
                     (
                         mix_number,
                         item["material_name"],
@@ -322,6 +336,78 @@ def add_invoice(
     return mix_number
 
 
+def _diff_mix_items(conn: Any, mix_number: str, new_items: list[dict]) -> dict[str, int]:
+    """
+    يطبّق diff بين بنود الفاتورة القديمة والجديدة بدل حذف الكل وإعادة إدراجه.
+
+    تحصين المرحلة 4: الحذف الكلي كان يفقد id الأصلي لكل بند ويطمس
+    price_snapshot_at — ما يكسر تتبع التدقيق («هذا البند تغيّر متى؟»).
+    القواعد:
+        - بند مطابق (نفس المادة + الكمية + السعر): يُترك كما هو (unchanged).
+        - بند بنفس المادة وكمية/سعر مختلف: UPDATE — يحتفظ بـ id
+          وبـ price_snapshot_at الأصلي (لا يُعاد كتابته عند التعديل).
+        - بند جديد لا يوجد له مقابل: INSERT مع طابع سعري جديد.
+        - بند قديم لم يعد في القائمة: DELETE بحسب id الخاص به فقط.
+    يعيد عدّادات {'inserted', 'updated', 'deleted', 'unchanged'} لتسجيلها
+    في audit_log بدقة.
+    """
+    old = conn.execute(
+        "SELECT id, material_name, qty_kg, unit_price, total_price "
+        "FROM mix_items WHERE mix_number = ? ORDER BY id ASC",
+        (str(mix_number),),
+    ).fetchall()
+
+    def _key(name: str, qty: float, price: float) -> tuple[str, float, float]:
+        # تقريب موحد لطريقة التخزين: كمية 3 خانات وسعر خانتان (كما في _validate_items)
+        return (str(name), round(safe_float(qty), 3), round(safe_float(price), 2))
+
+    old_by_key: dict[tuple[str, float, float], list[Any]] = {}
+    for row in old:
+        old_by_key.setdefault(_key(row[1], row[2], row[3]), []).append(row)
+
+    used_ids: set[int] = set()
+    inserted = updated = unchanged = 0
+    for it in new_items:
+        key = _key(it["material_name"], it["qty_kg"], it["unit_price"])
+        candidates = [r for r in old_by_key.get(key, []) if int(r[0]) not in used_ids]
+        if candidates:
+            # مطابق تماماً — لا لمس للصفحة الأصلية (يحفظ id والطابع الزمني)
+            used_ids.add(int(candidates[0][0]))
+            unchanged += 1
+            continue
+        # هل يوجد بند قديم بنفس المادة (كمية/سعر تغيّرا)؟ → UPDATE يحفظ id
+        same_material = [r for r in old
+                         if str(r[1]) == str(it["material_name"]) and int(r[0]) not in used_ids]
+        if same_material:
+            row = same_material[0]
+            conn.execute(
+                "UPDATE mix_items SET qty_kg = ?, unit_price = ?, total_price = ? "
+                "WHERE id = ?",
+                (it["qty_kg"], it["unit_price"], it["total_price"], int(row[0])),
+            )
+            used_ids.add(int(row[0]))
+            updated += 1
+        else:
+            conn.execute(
+                "INSERT INTO mix_items "
+                "(mix_number, material_name, qty_kg, unit_price, total_price, price_snapshot_at) "
+                "VALUES (?, ?, ?, ?, ?, datetime('now','localtime'))",
+                (str(mix_number), it["material_name"], it["qty_kg"],
+                 it["unit_price"], it["total_price"]),
+            )
+            inserted += 1
+
+    # احذف البنود القديمة التي لم تعد موجودة في القائمة الجديدة (بالid فقط)
+    deleted = 0
+    for row in old:
+        if int(row[0]) not in used_ids:
+            conn.execute("DELETE FROM mix_items WHERE id = ?", (int(row[0]),))
+            deleted += 1
+
+    return {"inserted": inserted, "updated": updated,
+            "deleted": deleted, "unchanged": unchanged}
+
+
 def update_invoice(
     mix_number: str,
     farm_name: str | None = None,
@@ -345,6 +431,12 @@ def update_invoice(
     new_farm = validate_name(farm_name, "المزرعة", min_length=1) if farm_name is not None else str(old.get("farm_name") or "")
     if farms_repo.get_farm_by_name(new_farm) is None:
         raise ValueError(f"المزرعة «{new_farm}» غير موجودة")
+
+    # تحصين المرحلة 4: لا تُقبل حالة دفع عشوائية حتى في المسار الجزئي
+    # (None = إبقاء الحالة القديمة دون تغيير كما كان السلوك).
+    new_status: Any = None
+    if payment_status is not None:
+        new_status = validate_choice(payment_status, settings.PAYMENT_STATUSES, "حالة الدفع")
 
     cleaned_items = _validate_items(items) if items is not None else old.get("items", [])
     totals = _compute_invoice_totals(cleaned_items, new_farm, electricity_fee, labor_fee_per_ton)
@@ -376,7 +468,7 @@ def update_invoice(
         "total_weight": totals["total_weight"],
         "total_cost": totals["total_cost"],
         "mixer_net_cost": round(net_cost, 2),
-        "payment_status": payment_status if payment_status is not None else old.get("payment_status"),
+        "payment_status": new_status if new_status is not None else old.get("payment_status"),
         "notes": str(notes).strip() if notes is not None else old.get("notes"),
         "elec_fee": totals["elec_fee"],
         "labor_fee": totals["labor_fee"],
@@ -400,19 +492,23 @@ def update_invoice(
             if fields:
                 params.append(str(mix_number))
                 conn.execute(f"UPDATE mix_invoices SET {', '.join(fields)} WHERE mix_number = ?", tuple(params))
-            # استبدال البنود
-            conn.execute("DELETE FROM mix_items WHERE mix_number = ?", (str(mix_number),))
-            for item in cleaned_items:
-                conn.execute(
-                    "INSERT INTO mix_items (mix_number, material_name, qty_kg, unit_price, total_price) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (str(mix_number), item["material_name"], item["qty_kg"], item["unit_price"], item["total_price"]),
-                )
+            # تحصين المرحلة 4: diff بدل DELETE كامل + INSERT — يحافظ على
+            # id البنود غير المتغيرة وعلى price_snapshot_at الأصلي للتدقيق.
+            if items is not None:
+                item_stats = _diff_mix_items(conn, str(mix_number), cleaned_items)
+            else:
+                item_stats = {"inserted": 0, "updated": 0, "deleted": 0,
+                              "unchanged": len(cleaned_items)}
     except Exception as exc:  # noqa: BLE001
         _log.error("تعذر تحديث الفاتورة %s: %s", mix_number, exc)
         raise ValueError("تعذر تحديث الفاتورة") from exc
 
-    log_audit("UPDATE", "mix_invoices", mix_number, changes, {"id": mix_number})
+    # تحصين المرحلة 4: audit_log يعكس عدد البنود المُدرجة/المعدلة/المحذوفة
+    # بدقة. ملاحظة بنيوية: سجل التدقيق يخزّن old_value فقط (new_value ثابت
+    # لدى المناديات القديمة كـ {"id": ...}) — لذا يُدمج ملخص الـ diff داخل
+    # old_value ليظهر في سجل التدقيق دون تغيير توقيع log_audit.
+    changes["items_diff"] = item_stats
+    log_audit("UPDATE", "mix_invoices", mix_number, changes, {"id": str(mix_number)})
     cache.invalidate_prefix("farms:")
     cache.invalidate_prefix("inventory")
     cache.invalidate("mix_invoices")
@@ -446,23 +542,93 @@ def _check_invoice_inventory_after_update(mix_number: str, items: list[dict]) ->
             )
 
 
+def _farm_payments_total(farm_name: str) -> float:
+    """مجموع مدفوعات المزرعة (الدفعات مرتبطة بالاسم لا برقم الفاتورة)."""
+    row = query_one(
+        "SELECT COALESCE(SUM(amount), 0) AS total FROM payments WHERE farm_name = ?",
+        (str(farm_name or ""),),
+    )
+    return safe_float((row or {}).get("total"))
+
+
+def _farm_other_net_total(farm_name: str, exclude_mix_number: str) -> float:
+    """مجموع صافي الفواتير النشطة الأخرى للمزرعة (باستثناء المستثناة)."""
+    row = query_one(
+        "SELECT COALESCE(SUM(mixer_net_cost), 0) AS total FROM mix_invoices "
+        "WHERE farm_name = ? AND (is_deleted = 0 OR is_deleted IS NULL) "
+        "AND mix_number <> ?",
+        (str(farm_name or ""), str(exclude_mix_number)),
+    )
+    return safe_float((row or {}).get("total"))
+
+
 def soft_delete_invoice(mix_number: str, created_by: str | None = None) -> bool:
-    """يُعلّم الفاتورة كمحذوفة (soft delete) دون حذف الفعلي."""
+    """
+    يُعلّم الفاتورة كمحذوفة (soft delete) دون حذف فعلي.
+
+    تحصين المرحلة 4: الدفعات تُسجَّل على اسم المزرعة ولا ترتبط برقم فاتورة،
+    لذا حذف فاتورة مسددَة يجعل الرصيد سالباً (دفعة يتيمة). نفحص ذلك قبل
+    الحذف ونرفض برسالة عربية واضحة؛ الواجهة (ui/tabs/invoices.py) تعرض
+    str(exc) في Toast عند ValueError — لا حاجة لتعديلها.
+    """
     invoice = get_invoice(mix_number)
     if not invoice:
         return False
     if bool(invoice.get("is_deleted")):
         return False
+
+    farm_name = str(invoice.get("farm_name") or "")
+    paid_total = _farm_payments_total(farm_name)
+    other_net = 0.0
+    balance_before = 0.0
+    balance_after = 0.0
+    if paid_total > 0:
+        other_net = _farm_other_net_total(farm_name, str(mix_number))
+        balance_before = other_net + safe_float(invoice.get("mixer_net_cost")) - paid_total
+        balance_after = other_net - paid_total
+        if paid_total > other_net + 1e-9:
+            # الرصيد بعد الحذف سيصبح سالباً — ارفض وسجّل المحاولة للمراجعة
+            log_audit(
+                "DELETE_BLOCKED",
+                "mix_invoices",
+                mix_number,
+                {"is_deleted": 0},
+                {
+                    "reason": "مدفوعات تتجاوز صافي الفواتير الأخرى",
+                    "payments_total": round(paid_total, 2),
+                    "other_net_total": round(other_net, 2),
+                    "balance_before": round(balance_before, 2),
+                    "balance_after": round(balance_after, 2),
+                },
+                user=created_by,
+            )
+            raise ValueError(
+                f"⚠️ تحذير: الفاتورة لها دفعات مسجلة على المزرعة «{farm_name}». "
+                f"حذفها سيجعل رصيد المزرعة سالباً "
+                f"(الرصيد الحالي: {balance_before:,.2f} ← بعد الحذف: {balance_after:,.2f}). "
+                f"راجع الوضع أولاً: احذف/عدّل الدفعات المرتبطة قبل حذف الفاتورة، "
+                f"أو استخدم الأرشفة بدل الحذف."
+            )
+
     execute(
         "UPDATE mix_invoices SET is_deleted = 1, deleted_at = datetime('now','localtime') WHERE mix_number = ?",
         (str(mix_number),),
     )
+    details: dict[str, Any] = {"is_deleted": 1, "deleted_at": invoice.get("mix_date")}
+    if paid_total > 0:
+        # حذف مسموح لكن توجد دفعات — سجّل الأرصدة للمساءلة (audit trail)
+        details.update({
+            "payments_total": round(paid_total, 2),
+            "other_net_total": round(other_net, 2),
+            "balance_before": round(balance_before, 2),
+            "balance_after": round(balance_after, 2),
+        })
     log_audit(
         "DELETE",
         "mix_invoices",
         mix_number,
         {"is_deleted": 0},
-        {"is_deleted": 1, "deleted_at": invoice.get("mix_date")},
+        details,
         user=created_by,
     )
     cache.invalidate_prefix("inventory")
@@ -517,10 +683,9 @@ def delete_invoice_permanent(mix_number: str) -> bool:
 
 def set_payment_status(mix_number: str, status: str, created_by: str | None = None) -> bool:
     """يحدث حالة الدفع للفاتورة."""
-    from config import settings as app_settings
-    status = str(status or "").strip()
-    if status not in app_settings.PAYMENT_STATUSES:
-        raise ValueError("حالة دفع غير صالحة")
+    # تحصين المرحلة 4: توحيد الآلية مع add_invoice عبر validate_choice
+    # (كان الفحص اليدوي هنا يعمل، لكن برسالة أقل تفصيلاً من المدقق الموحد).
+    status = validate_choice(status, settings.PAYMENT_STATUSES, "حالة الدفع")
     invoice = get_invoice(mix_number)
     if not invoice:
         return False
