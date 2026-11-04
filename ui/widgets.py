@@ -4,7 +4,7 @@ ui/widgets.py
 أدوات واجهة قابلة لإعادة الاستخدام تُبنى فوق ttk القياسي.
 
 المحتوى:
-    make_button        : زرttk بنمط دلالي (primary/accent/danger...) + اختصار لوحة.
+    make_button        : زر ttk بنمط دلالي (primary/accent/danger...) + اختصار لوحة.
     make_toolbar       : شريط أزرار أفقي موحد المسافات.
     attach_tree_search : بحث فوري أعلى أي Treeview (Ctrl+F) مع تظليل التطابق.
     make_date_entry    : حقل تاريخ — tkcalendar.DateEntry إن توفّر، وإلا Entry
@@ -15,6 +15,13 @@ ui/widgets.py
     export_tree_csv    : تصدير محتوى Treeview إلى CSV/Excel عبر reports.exporter.
 
 كل الدوال آمنة: تفشل بصمت مسجّلاً أو تعيد None عند غياب Tk في البيئة.
+
+إصلاح المرحلة 3 (TreeSearch): أُضيفت الطريقة refresh_snapshot() وربط الحدث
+المخصص <<TreeRefreshed>> على الـ Treeview — لأن _all_children كانت تُلتقط
+مرة واحدة عند __init__ فقط، فبعد أي refresh (clear_tree + insert بـ iids
+جديدة) يفقد البحث نتائجه. الآن تُطلق طبقة التبويبات (_common.fill_rows
+والتبويبات ذات الإدراج اليدوي) هذا الحدث بعد كل إعادة بناء فيُلتقط snapshot
+جديد ويظل البحث يعمل بعد F5.
 """
 
 from __future__ import annotations
@@ -119,6 +126,9 @@ class TreeSearch:
     - Ctrl+F يركّز على حقل البحث ويحدد نصه.
     - Esc يمسح البحث ويعرض كل الصفوف.
     - يعمل مع الأعمدة كلها (بحث substring غير حساس لحالة الأحرف).
+    - يتحدث تلقائياً بعد أي إعادة بناء للجدول عبر حدث <<TreeRefreshed>>
+      الذي تُطلقه طبقة التبويبات (ui/tabs/_common.fill_rows وغيرها)،
+      فلا تنكسر نتائج البحث بعد F5/refresh.
     """
 
     def __init__(self, tree: ttk.Treeview, entry: ttk.Entry | None = None,
@@ -140,6 +150,12 @@ class TreeSearch:
             tree.bind("<Control-f>", self.focus_search, add="+")
         except tk.TclError:
             pass
+        # إصلاح المرحلة 3: الاستماع لحدث إعادة بناء الجدول حتى لا تبقى
+        # _all_children تحمل iids قديمة محذوفة بعد أي refresh/F5
+        try:
+            tree.bind("<<TreeRefreshed>>", lambda _e: self.refresh_snapshot(), add="+")
+        except tk.TclError:
+            pass
         # تسجيل كل الصفوف الحالية
         self.snapshot()
 
@@ -147,9 +163,50 @@ class TreeSearch:
     def snapshot(self) -> None:
         """يعيد قراءة كل الصفوف الجذرية الحالية (استدعِها بعد كل refresh)."""
         try:
+            if not self.tree.winfo_exists():
+                self._all_children = []
+                return
             self._all_children = list(self.tree.get_children(""))
         except tk.TclError:
             self._all_children = []
+
+    def refresh_snapshot(self) -> None:
+        """يحدّث لقطة الصفوف — يستدعيها معالج حدث <<TreeRefreshed>>.
+
+        الإصلاح: كانت اللقطة تُبنى مرة واحدة في __init__ فقط؛ الآن تُعاد
+        قراءتها بعد كل clear_tree+insert فتعمل الفلترة على الصفوف الجديدة.
+        نؤجل إعادة التطبيق إلى after_idle لأن الإدراج يتم عادةً داخل معالج
+        حدث — والنداء المتداخل المباشر لـ detach/reattach لا يُطبَّق فوراً
+        في Tk، بينما يعمل بعد الحدث بأمان (وهو توقيت after(0) تماماً).
+        """
+        self.snapshot()
+        # إعادة تطبيق النص الحالي إن كان هناك بحث نشط حتى لا تظهر صفوف
+        # جديدة غير مُفلترة بعد التحديث
+        try:
+            needle = self.entry.get()
+        except tk.TclError:
+            needle = ""
+        if needle.strip():
+            try:
+                self.tree.after_idle(lambda: self._apply(self.entry.get()))
+            except tk.TclError:
+                pass
+
+    def fill(self, rows: Sequence[Sequence[Any]]) -> None:
+        """يمسح الجدول ثم يضيف الصفوف ويحدّث لقطة البحث (سلّم موثوق).
+
+        بديل آمن عن fill_rows عند استدعاء إعادة الملء داخل معالج حدث —
+        حيث لا يعمل event_generate إلا بعد انتهاء المعالج.
+        """
+        clear_tree(self.tree)
+        try:
+            for row in rows:
+                self.tree.insert("", "end",
+                                 values=tuple("" if v is None else v for v in row))
+        except tk.TclError:
+            _log.exception("تعذّر ملء الجدول")
+        # إصلاح المرحلة 3: تحديث اللقطة مباشرة هنا — لا يعتمد على الحدث
+        self.refresh_snapshot()
 
     def focus_search(self, _event: tk.Event | None = None) -> str:
         """يركّز على حقل البحث ويحدد محتواه (يُربط بـ Ctrl+F)."""
@@ -213,7 +270,11 @@ class TreeSearch:
 def attach_tree_search(tree: ttk.Treeview,
                        entry: ttk.Entry | None = None) -> TreeSearch:
     """اختصار لبناء TreeSearch حول Treeview (ينشئ حقل بحث فوقه إن لم يُعطَ)."""
-    return TreeSearch(tree, entry=entry)
+    ts = TreeSearch(tree, entry=entry)
+    # إصلاح المرحلة 3: حفظ مرجع للبحث على الجدول ليتمكن notify_refresh من
+    # تحديث اللقطة مباشرة (event_generate لا يعمل داخل معالجات الأحداث)
+    tree._feedmixer_search = ts  # type: ignore[attr-defined]
+    return ts
 
 
 # ============================================================
