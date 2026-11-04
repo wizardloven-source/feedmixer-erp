@@ -3,19 +3,23 @@ services/mix_service.py
 -----------------------
 منطق حساب تكاليف الخلطة وفحص المخزون قبل الحفظ.
 
-القواعد المحاسبية المطبَّقة (مطابقة لمواصفات النظام):
+القواعد المحاسبية المطبَّقة (Single Source of Truth — مطابقة تماماً
+لـ data/invoices_repo._compute_invoice_totals، ولا يجوز تعديل واحدة
+دون الأخرى؛ راجع tests/test_mix_calc.py الذي يفرض التطابق):
     1) سعر الكيلو من المادة حسب وحدة القياس:
          ton   : (base_price + handling_fee + loss_fee) / 1000
          kg    :  base_price + handling_fee + loss_fee
          fixed :  base_price
        (يُنفَّذ في core.utils.material_kg_price)
-    2) تكلفة العلف = Σ (qty_kg × سعر_الكيلو)
+    2) تكلفة العلف feed_cost = Σ (qty_kg × unit_price)
     3) أنصاف الأطنان القابلة للفوترة = int((kg_total + 249) / 500) * 0.5
-    4) أجور العمال = billable_tons × labor_fee_per_ton
-    5) الكهرباء     = billable_tons × electricity_fee
-    6) النقل        = transport_fee للمزرعة × billable_tons
-    7) الإجمالي = علف + كهرباء + عمال + نقل
-    8) الصافي   = الإجمالي إلا إذا عدِّل يدوياً (net_cost_manually_edited)
+    4) أجور العمال labor_cost = billable_tons × labor_fee_per_ton
+    5) الكهرباء     elec_cost = electricity_fee          ← قيمة ثابتة لكل خلطة
+       (حسب وصف DEFAULT_SETTINGS: "أجرة الكهرباء (لكل خلطة)")
+    6) النقل        transport_cost = farm.transport_fee  ← قيمة ثابتة لكل فاتورة
+       (حسب وصف DEFAULT_SETTINGS: "أجرة النقل الافتراضية")
+    7) الإجمالي total_cost = feed_cost + elec_cost + labor_cost + transport_cost
+    8) الصافي mixer_net_cost = total_cost إلا إذا عدِّل يدوياً (net_cost_override)
 
 تجميد السعر (Price Snapshot):
     - عند الإنشاء: السعر يُقرأ حيًّا من materials ويُخزَّن في mix_items.unit_price.
@@ -38,9 +42,33 @@ from core.utils import (
     safe_float,
     tons_to_kg,
 )
-from data import farms_repo, invoices_repo, settings_repo
+# ملاحظة (Defense in Depth / منع دورات الاستيراد):
+#   farms_repo / invoices_repo / settings_repo تُستورد بشكل كسول (lazy)
+#   داخل الدوال فقط — لأن طبقة البيانات قد تستدعي الخدمات لاحقاً.
+from data import materials_repo  # noqa: F401  (تأكد من توفر الطبقة مبكراً)
 
 log = get_logger("services.mix")
+
+
+def _settings_repo() -> Any:
+    """استيراد كسول لمستودع الإعدادات لتفادي دورات الاستيراد."""
+    from data import settings_repo as _sr
+
+    return _sr
+
+
+def _farms_repo() -> Any:
+    """استيراد كسول لمستودع المزارع لتفادي دورات الاستيراد."""
+    from data import farms_repo as _fr
+
+    return _fr
+
+
+def _invoices_repo() -> Any:
+    """استيراد كسول لمستودع الفواتير لتفادي دورات الاستيراد."""
+    from data import invoices_repo as _ir
+
+    return _ir
 
 
 # ============================================================
@@ -136,27 +164,41 @@ def calculate_mix(
     """
     الحساب الكامل للخلطة قبل الحفظ أو أثناء المعاينة الحيّة.
 
+    ⚠️ Single Source of Truth:
+        هذه الدالة مطابقة حرفياً في قواعدها لـ
+        data/invoices_repo._compute_invoice_totals — أي تغيير في
+        واحدة يجب أن يُطبَّق على الأخرى، ويثبّته tests/test_mix_calc.py:
+            feed_cost      = Σ (qty_kg × unit_price)
+            elec_cost      = electricity_fee          (قيمة ثابتة لكل خلطة)
+            labor_cost     = billable_tons × labor_fee_per_ton
+            transport_cost = farm.transport_fee       (قيمة ثابتة لكل فاتورة)
+            total_cost     = feed + elec + labor + transport
+            mixer_net_cost = total_cost إلا عند التعديل اليدوي
+
     يستخدم price_items_frozen — أي أنه يحترم unit_price المجمّد
     في البنود إن وُجد (فاتورة قائمة)، وإلا يحسب حيًّا (نموذج جديد).
     """
+    from data import settings_repo as _srepo  # استيراد كسول (lazy)
+
     priced = price_items_frozen(items)
     total_weight_kg = sum(float(p["qty_kg"]) for p in priced)
     billable = calc_billable_tons(total_weight_kg)
 
     # أسعار الإعدادات (مع fallback إلى القيم الافتراضية)
-    elec_rate = safe_float(settings_repo.get_setting(
+    elec_rate = safe_float(_srepo.get_setting(
         "electricity_fee", settings.DEFAULT_SETTINGS["electricity_fee"]))
-    labor_rate = safe_float(settings_repo.get_setting(
+    labor_rate = safe_float(_srepo.get_setting(
         "labor_fee_per_ton", settings.DEFAULT_SETTINGS["labor_fee_per_ton"]))
 
     feed_cost = round_money(sum(float(p["total_price"]) for p in priced))
-    elec_cost = round_money(billable * elec_rate)
+    # الكهرباء قيمة ثابتة لكل خلطة (وليست مضروبة في الأطنان) — مطابقة لـ invoices_repo
+    elec_cost = round_money(elec_rate)
     labor_cost = round_money(billable * labor_rate)
 
-    # أجرة النقل خاصة بالمزرعة (لكل طن قابل للفوترة)
-    farm = farms_repo.get_farm_by_name(farm_name) or {}
+    # أجرة النقل قيمة ثابتة خاصة بالمزرعة لكل فاتورة (وليست مضروبة في الأطنان)
+    farm = _farms_repo().get_farm_by_name(farm_name) or {}
     farm_transport_rate = safe_float(farm.get("transport_fee"), 0.0)
-    transport_cost = round_money(billable * farm_transport_rate)
+    transport_cost = round_money(farm_transport_rate)
 
     total_cost = round_money(feed_cost + elec_cost + labor_cost + transport_cost)
 
