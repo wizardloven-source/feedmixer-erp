@@ -1,0 +1,83 @@
+# ============================================================
+# FeedMixer ERP v3.0 — Git Ignore
+# ============================================================
+
+# --- قاعدة البيانات (الأهم) ---
+storage/*.db
+storage/*.db-wal
+storage/*.db-shm
+storage/*.sqlite
+storage/*.sqlite3
+storage/backups/
+storage/ui_state.json
+!storage/.gitkeep
+
+# --- ملفات مُولّدة ---
+logs/*
+!logs/.gitkeep
+prints/*
+!prints/.gitkeep
+exports/*
+!exports/.gitkeep
+*.log
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# --- اختبارات ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# --- نسخ احتياطية ---
+*.bak
+*.bak[0-9]
+*.bak[0-9][0-9]
+*.bak_*
+*.backup
+*.old
+*.orig
+*.swp
+*.swo
+*~
+*.tmp
+*.temp
+
+# --- محرر ---
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# --- نظام ---
+.DS_Store
+._*
+Thumbs.db
+desktop.ini
+
+# --- أسرار ---
+.env
+.env.*
+!.env.example
+secrets.json
+*.secret
+*.pem
+*.key
+
+# --- ملفات collect_all_code ---
+Project_Backup_Code_*.txt
