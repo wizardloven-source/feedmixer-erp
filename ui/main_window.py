@@ -236,20 +236,24 @@ class FeedMixerERP(tk.Tk):
     # ========================================================
     # عمليات عامة تُوجَّه للتبويب الحالي
     # ========================================================
-    @staticmethod
-    def _safe(fn: Callable[[], Any]) -> Callable[[], None]:
-        """لفّف دالة بحيث لا يُسقط أي استثناء التطبيق."""
+    def _safe(self, fn: Callable[[], Any]) -> Callable[[], None]:
+        """لفّف دالة بحيث لا يُسقط أي استثناء التطبيق.
+
+        إصلاح حرج: كانت staticmethod تحاول قراءة wrapper.__self__ وهي دائماً
+        None للدالة المتداخلة — فلم يكن Toast يظهر للمستخدم عند أخطاء الأزرار.
+        الآن صارت دالة عضو تقبل self مباشرة، مع الحفاظ على نفس التوقيع الخارجي
+        self._safe(fn) حتى لا تنكسر أي استدعاءات قائمة.
+        """
         def wrapper() -> None:
             try:
                 fn()
             except Exception as exc:  # noqa: BLE001
                 _log.exception("خطأ في إجراء واجهة")
+                # الإصلاح: عرض الخطأ للمستخدم عبر Toast (كان يذهب للسجل فقط)
                 try:
-                    w = wrapper.__self__ if hasattr(wrapper, "__self__") else None
-                except Exception:
-                    w = None
-                if isinstance(w, FeedMixerERP):
-                    w.toast(f"حدث خطأ: {exc}", "error")
+                    self.toast(f"حدث خطأ: {exc}", "error")
+                except Exception:  # noqa: BLE001
+                    pass  # لا نكسر شيئاً إذا فشل Toast نفسه
         return wrapper
 
     def _call_tab(self, method: str, *args: Any) -> bool:

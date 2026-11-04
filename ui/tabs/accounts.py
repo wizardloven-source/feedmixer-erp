@@ -130,8 +130,14 @@ class AccountsController:
             return
         try:
             from ui.dialogs.payment_dialog import PaymentDialog
-            PaymentDialog(self.app, farm_name=farm)
-            self.refresh()
+            # إصلاح حرج: كان refresh() يُنفَّذ فور فتح الحوار (قبل إدخال أي
+            # بيانات). الآن ننتظر إغلاق النافذة بـ wait_window ثم نتحقق من
+            # dlg.saved — نفس نمط ui/tabs/farms.py و ui/tabs/payments.py.
+            dlg = PaymentDialog(self.app, self.app, farm_name=farm)
+            self.app.wait_window(dlg)
+            if getattr(dlg, "saved", False):
+                self.refresh()
+                self.app.refresh_all()
         except Exception as exc:  # noqa: BLE001
             _log.exception("فشل فتح نافذة الدفعة")
             self.app.toast(f"خطأ: {exc}", "error")
@@ -205,8 +211,14 @@ class AccountsController:
                 try:
                     from ui.dialogs.payment_dialog import PaymentDialog
 
-                    PaymentDialog(self.app, farm_name=farm)
-                    self.refresh()
+                    # إصلاح حرج (نفس نمط add_payment): انتظار إغلاق الحوار
+                    # قبل التحديث، والتحقق من dlg.saved — وإلا كان refresh()
+                    # يُنفَّذ فوراً قبل أن يُدخل المستخدم أي بيانات.
+                    dlg = PaymentDialog(self.app, self.app, farm_name=farm)
+                    self.app.wait_window(dlg)
+                    if getattr(dlg, "saved", False):
+                        self.refresh()
+                        self.app.refresh_all()
                 except Exception as exc:  # noqa: BLE001
                     _log.exception("فشل فتح نافذة الدفعة")
                     self.app.toast(f"خطأ: {exc}", "error")

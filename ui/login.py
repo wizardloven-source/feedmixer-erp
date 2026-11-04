@@ -122,18 +122,32 @@ class LoginDialog(tk.Toplevel):
         self.bind("<Escape>", lambda _e: self.cancel())
 
     def _center_over_master(self) -> None:
+        """توسيط نافذة الدخول في منتصف الشاشة.
+
+        إصلاح حرج: الـ master هو root المخفي (root.withdraw() في app.py)،
+        و winfo_width()/winfo_height() له تساوي 1 قبل العرض — فكانت النافذة
+        تظهر قرب الزاوية العليا اليسرى بدلاً من الوسط. نعتمد الآن على أبعاد
+        الشاشة مباشرة، مع fallback للتوسيط فوق master فقط إذا كان مرئياً
+        فعلاً (winfo_viewable() == 1) — لدعم أي استخدام مستقبلي.
+        """
         try:
             self.update_idletasks()
-            master = self.master
-            if master is not None and master.winfo_exists():
-                mx, my = master.winfo_rootx(), master.winfo_rooty()
-                mw, mh = max(master.winfo_width(), 300), max(master.winfo_height(), 200)
-            else:
-                mx, my = 0, 0
-                mw, mh = self.winfo_screenwidth(), self.winfo_screenheight()
             w, h = 420, 300
-            x = mx + max((mw - w) // 2, 0)
-            y = my + max((mh - h) // 2 - 40, 0)
+            sw = self.winfo_screenwidth()
+            sh = self.winfo_screenheight()
+            mx, my = 0, 0
+            master = self.master
+            # لا نقيس master إلا إذا كان مرئياً (تجنب root المخفي بعرض=1)
+            if (master is not None and master.winfo_exists()
+                    and master.winfo_viewable()):
+                mx, my = master.winfo_rootx(), master.winfo_rooty()
+                mw, mh = max(master.winfo_width(), w), max(master.winfo_height(), h)
+                x = mx + max((mw - w) // 2, 0)
+                y = my + max((mh - h) // 2 - 40, 0)
+            else:
+                # التوسيط في وسط الشاشة بالكامل — السلوك المعتمد في التطبيق
+                x = max((sw - w) // 2, 0)
+                y = max((sh - h) // 2 - 40, 0)
             self.geometry(f"{w}x{h}+{x}+{y}")
         except tk.TclError as exc:
             _log.debug("تعذّر توسيط نافذة الدخول: %s", exc)
